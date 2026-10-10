@@ -83,7 +83,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Check out REACH source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
           ref: ${{ steps.meta.outputs.ref }}
@@ -108,12 +108,12 @@ jobs:
     needs: resolve-source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
           ref: ${{ needs.resolve-source.outputs.ref }}
           path: reach
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
           cache: npm
@@ -129,12 +129,12 @@ jobs:
     needs: resolve-source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
           ref: ${{ needs.resolve-source.outputs.ref }}
           path: reach
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: reach/Backend/go.mod
           cache-dependency-path: reach/Backend/go.mod
@@ -147,12 +147,12 @@ jobs:
     needs: resolve-source
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
           ref: ${{ needs.resolve-source.outputs.ref }}
           path: reach
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
           cache: pip
@@ -186,8 +186,8 @@ jobs:
       GCP_REGION: ${{ vars.GCP_REGION }}
       GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
           ref: ${{ needs.resolve-source.outputs.ref }}
