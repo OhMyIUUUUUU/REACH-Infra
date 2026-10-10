@@ -1,0 +1,12 @@
+.git
+reach/.git
+reach/Docs
+**/*.pdf
+**/node_modules
+**/.venv
+**/__pycache__
+**/dist
+**/*.pyc
+**/.env
+**/.env.*
+!**/.env.example

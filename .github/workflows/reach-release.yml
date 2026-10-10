@@ -1,0 +1,346 @@
+name: REACH CI/CD
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      reach_tag:
+        description: REACH release tag to build (for example v1.2.3)
+        required: true
+        type: string
+      deploy:
+        description: Publish images and deploy to Cloud Run (requires GCP variables and identity setup)
+        required: true
+        default: false
+        type: boolean
+  repository_dispatch:
+    types:
+      - reach_release
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-source:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.meta.outputs.ref }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      expected_sha: ${{ steps.meta.outputs.expected_sha }}
+      deploy: ${{ steps.meta.outputs.deploy }}
+      source_sha: ${{ steps.checkout.outputs.source_sha }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Resolve source revision
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.reach_tag }}
+          INPUT_DEPLOY: ${{ inputs.deploy }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          release_tag=""
+          expected_sha=""
+          deploy=false
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              release_tag="$INPUT_TAG"
+              if [[ "$INPUT_DEPLOY" == "true" ]]; then
+                deploy=true
+              fi
+              ;;
+            repository_dispatch)
+              release_tag="$PAYLOAD_TAG"
+              expected_sha="$PAYLOAD_SHA"
+              deploy=true
+              ;;
+          esac
+
+          if [[ -n "$release_tag" && ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must use vMAJOR.MINOR.PATCH format (optional prerelease/build suffix): $release_tag" >&2
+            exit 1
+          fi
+
+          source_ref="${release_tag:-main}"
+          if [[ -n "$release_tag" && "$deploy" == "true" ]]; then
+            image_tag="$release_tag"
+          else
+            image_tag="ci-${GITHUB_SHA::12}"
+          fi
+
+          {
+            echo "ref=$source_ref"
+            echo "release_tag=$release_tag"
+            echo "expected_sha=$expected_sha"
+            echo "deploy=$deploy"
+            echo "image_tag=$image_tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out REACH source
+        uses: actions/checkout@v4
+        with:
+          repository: OhMyIUUUUUU/REACH
+          ref: ${{ steps.meta.outputs.ref }}
+          path: reach
+          fetch-depth: 0
+
+      - name: Verify source revision
+        id: checkout
+        env:
+          EXPECTED_SHA: ${{ steps.meta.outputs.expected_sha }}
+        run: |
+          set -euo pipefail
+          source_sha="$(git -C reach rev-parse HEAD)"
+          if [[ -n "$EXPECTED_SHA" && "$source_sha" != "$EXPECTED_SHA" ]]; then
+            echo "Dispatched SHA $EXPECTED_SHA does not match checked-out REACH commit $source_sha" >&2
+            exit 1
+          fi
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "Building REACH revision $source_sha"
+
+  verify-frontend:
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: OhMyIUUUUUU/REACH
+          ref: ${{ needs.resolve-source.outputs.ref }}
+          path: reach
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: reach/Frontend/package-lock.json
+      - run: npm ci
+        working-directory: reach/Frontend
+      - run: npm run lint
+        working-directory: reach/Frontend
+      - run: npm run build
+        working-directory: reach/Frontend
+
+  verify-backend:
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: OhMyIUUUUUU/REACH
+          ref: ${{ needs.resolve-source.outputs.ref }}
+          path: reach
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: reach/Backend/go.mod
+          cache-dependency-path: reach/Backend/go.mod
+      - run: go test ./...
+        working-directory: reach/Backend
+      - run: go build -o /tmp/reach-backend .
+        working-directory: reach/Backend
+
+  verify-nlp:
+    needs: resolve-source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: OhMyIUUUUUU/REACH
+          ref: ${{ needs.resolve-source.outputs.ref }}
+          path: reach
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: reach/Nlp-service/requirements.txt
+      - run: python -m pip install -r reach/Nlp-service/requirements.txt pytest
+      - run: python -m pytest -q tests
+        working-directory: reach/Nlp-service
+
+  build-images:
+    needs:
+      - resolve-source
+      - verify-frontend
+      - verify-backend
+      - verify-nlp
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: frontend
+            dockerfile: ./deploy/frontend/Dockerfile
+          - service: backend
+            dockerfile: ./deploy/backend/Dockerfile
+          - service: nlp
+            dockerfile: ./deploy/nlp/Dockerfile
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: OhMyIUUUUUU/REACH
+          ref: ${{ needs.resolve-source.outputs.ref }}
+          path: reach
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Validate GCP publishing settings
+        if: needs.resolve-source.outputs.deploy == 'true'
+        env:
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          CLOUD_RUN_PUBLIC_API: ${{ vars.CLOUD_RUN_PUBLIC_API }}
+        run: |
+          set -euo pipefail
+          for setting in GCP_PROJECT_ID GCP_REGION GAR_REPOSITORY GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT; do
+            if [[ -z "${!setting:-}" ]]; then
+              echo "Required GitHub repository variable is missing: $setting" >&2
+              exit 1
+            fi
+          done
+          if [[ "$CLOUD_RUN_PUBLIC_API" != "true" ]]; then
+            echo "Set CLOUD_RUN_PUBLIC_API=true only after reviewing the unauthenticated Go API exposure." >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        if: needs.resolve-source.outputs.deploy == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Configure Artifact Registry authentication
+        if: needs.resolve-source.outputs.deploy == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Log in to Artifact Registry
+        if: needs.resolve-source.outputs.deploy == 'true'
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Resolve image tags
+        id: image
+        env:
+          DEPLOY: ${{ needs.resolve-source.outputs.deploy }}
+          IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
+          SOURCE_SHA: ${{ needs.resolve-source.outputs.source_sha }}
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          if [[ "$DEPLOY" == "true" ]]; then
+            image_base="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/reach-${SERVICE}"
+          else
+            image_base="reach-${SERVICE}"
+          fi
+          {
+            echo "release_image=${image_base}:${IMAGE_TAG}"
+            echo "sha_image=${image_base}:${SOURCE_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and optionally publish image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ needs.resolve-source.outputs.deploy == 'true' }}
+          tags: |
+            ${{ steps.image.outputs.release_image }}
+            ${{ steps.image.outputs.sha_image }}
+
+  deploy-cloud-run:
+    needs:
+      - resolve-source
+      - build-images
+    if: needs.resolve-source.outputs.deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+    steps:
+      - name: Require explicit public API opt-in
+        env:
+          CLOUD_RUN_PUBLIC_API: ${{ vars.CLOUD_RUN_PUBLIC_API }}
+        run: |
+          if [[ "$CLOUD_RUN_PUBLIC_API" != "true" ]]; then
+            echo "Set repository variable CLOUD_RUN_PUBLIC_API=true only after reviewing that the Go API currently has no authentication." >&2
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Deploy Go API
+        env:
+          IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
+        run: |
+          gcloud run deploy reach-backend \
+            --image "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/reach-backend:${IMAGE_TAG}" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --port 8080 \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Deploy private NLP service
+        env:
+          IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
+        run: |
+          gcloud run deploy reach-nlp \
+            --image "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/reach-nlp:${IMAGE_TAG}" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --port 8080 \
+            --memory 2Gi \
+            --no-allow-unauthenticated \
+            --quiet
+
+      - name: Deploy frontend
+        env:
+          IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
+        run: |
+          backend_url="$(gcloud run services describe reach-backend \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --format='value(status.url)')"
+          gcloud run deploy reach-frontend \
+            --image "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/reach-frontend:${IMAGE_TAG}" \
+            --project "$GCP_PROJECT_ID" \
+            --region "$GCP_REGION" \
+            --port 8080 \
+            --set-env-vars "BACKEND_URL=${backend_url}" \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Smoke test deployed services
+        run: |
+          set -euo pipefail
+          frontend_url="$(gcloud run services describe reach-frontend --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
+          nlp_url="$(gcloud run services describe reach-nlp --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
+          test -n "$frontend_url"
+          test -n "$nlp_url"
+          curl --fail --silent --show-error "$frontend_url/" >/dev/null
+          curl --fail --silent --show-error "$frontend_url/api/health" | grep -q '"status":"ok"'
