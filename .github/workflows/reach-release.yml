@@ -59,6 +59,10 @@ jobs:
               release_tag="$PAYLOAD_TAG"
               expected_sha="$PAYLOAD_SHA"
               deploy=true
+              if [[ -z "$release_tag" || -z "$expected_sha" ]]; then
+                echo "repository_dispatch requires both client_payload.tag and client_payload.sha" >&2
+                exit 1
+              fi
               ;;
           esac
 
@@ -111,7 +115,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
-          ref: ${{ needs.resolve-source.outputs.ref }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
           path: reach
       - uses: actions/setup-node@v5
         with:
@@ -132,41 +136,23 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
-          ref: ${{ needs.resolve-source.outputs.ref }}
-          path: reach
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: reach/Backend/go.mod
-          cache-dependency-path: reach/Backend/go.mod
-      - run: go test ./...
-        working-directory: reach/Backend
-      - run: go build -o /tmp/reach-backend .
-        working-directory: reach/Backend
-
-  verify-nlp:
-    needs: resolve-source
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          repository: OhMyIUUUUUU/REACH
-          ref: ${{ needs.resolve-source.outputs.ref }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
           path: reach
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
+          python-version: "3.12"
           cache: pip
-          cache-dependency-path: reach/Nlp-service/requirements.txt
-      - run: python -m pip install -r reach/Nlp-service/requirements.txt pytest
+          cache-dependency-path: reach/Backend/requirements.txt
+      - run: python -m pip install -r requirements.txt
+        working-directory: reach/Backend
       - run: python -m pytest -q tests
-        working-directory: reach/Nlp-service
+        working-directory: reach/Backend
 
   build-images:
     needs:
       - resolve-source
       - verify-frontend
       - verify-backend
-      - verify-nlp
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -179,8 +165,6 @@ jobs:
             dockerfile: ./deploy/frontend/Dockerfile
           - service: backend
             dockerfile: ./deploy/backend/Dockerfile
-          - service: nlp
-            dockerfile: ./deploy/nlp/Dockerfile
     env:
       GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
       GCP_REGION: ${{ vars.GCP_REGION }}
@@ -190,7 +174,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           repository: OhMyIUUUUUU/REACH
-          ref: ${{ needs.resolve-source.outputs.ref }}
+          ref: ${{ needs.resolve-source.outputs.source_sha }}
           path: reach
       - uses: docker/setup-buildx-action@v3
 
@@ -209,7 +193,7 @@ jobs:
             fi
           done
           if [[ "$CLOUD_RUN_PUBLIC_API" != "true" ]]; then
-            echo "Set CLOUD_RUN_PUBLIC_API=true only after reviewing the unauthenticated Go API exposure." >&2
+            echo "Set CLOUD_RUN_PUBLIC_API=true only after reviewing the public FastAPI API exposure." >&2
             exit 1
           fi
 
@@ -278,7 +262,7 @@ jobs:
           CLOUD_RUN_PUBLIC_API: ${{ vars.CLOUD_RUN_PUBLIC_API }}
         run: |
           if [[ "$CLOUD_RUN_PUBLIC_API" != "true" ]]; then
-            echo "Set repository variable CLOUD_RUN_PUBLIC_API=true only after reviewing that the Go API currently has no authentication." >&2
+            echo "Set repository variable CLOUD_RUN_PUBLIC_API=true only after reviewing the public FastAPI API exposure." >&2
             exit 1
           fi
 
@@ -293,7 +277,7 @@ jobs:
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
-      - name: Deploy Go API
+      - name: Deploy FastAPI backend
         env:
           IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
         run: |
@@ -302,20 +286,8 @@ jobs:
             --project "$GCP_PROJECT_ID" \
             --region "$GCP_REGION" \
             --port 8080 \
+            --update-env-vars "APP_ENV=production,DEBUG=false" \
             --allow-unauthenticated \
-            --quiet
-
-      - name: Deploy private NLP service
-        env:
-          IMAGE_TAG: ${{ needs.resolve-source.outputs.image_tag }}
-        run: |
-          gcloud run deploy reach-nlp \
-            --image "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/${GAR_REPOSITORY}/reach-nlp:${IMAGE_TAG}" \
-            --project "$GCP_PROJECT_ID" \
-            --region "$GCP_REGION" \
-            --port 8080 \
-            --memory 2Gi \
-            --no-allow-unauthenticated \
             --quiet
 
       - name: Deploy frontend
@@ -331,16 +303,17 @@ jobs:
             --project "$GCP_PROJECT_ID" \
             --region "$GCP_REGION" \
             --port 8080 \
-            --set-env-vars "BACKEND_URL=${backend_url}" \
+            --update-env-vars "BACKEND_URL=${backend_url}" \
             --allow-unauthenticated \
             --quiet
 
       - name: Smoke test deployed services
         run: |
           set -euo pipefail
+          backend_url="$(gcloud run services describe reach-backend --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
           frontend_url="$(gcloud run services describe reach-frontend --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
-          nlp_url="$(gcloud run services describe reach-nlp --project "$GCP_PROJECT_ID" --region "$GCP_REGION" --format='value(status.url)')"
+          test -n "$backend_url"
           test -n "$frontend_url"
-          test -n "$nlp_url"
+          curl --fail --silent --show-error "$backend_url/api/health" | grep -q '"status":"ok"'
           curl --fail --silent --show-error "$frontend_url/" >/dev/null
           curl --fail --silent --show-error "$frontend_url/api/health" | grep -q '"status":"ok"'
