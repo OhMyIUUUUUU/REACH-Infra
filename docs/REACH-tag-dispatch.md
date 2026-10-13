@@ -6,7 +6,7 @@ This guide connects a pushed version tag in the `REACH` repository to the CI/CD 
 
 1. A version tag such as `v1.2.3` is pushed to `REACH`.
 2. A GitHub Actions workflow in `REACH` sends a `repository_dispatch` event to `REACH-Infra`, including the tag and commit SHA.
-3. `REACH-Infra/.github/workflows/reach-release.yml` checks out that exact REACH tag, verifies its SHA, runs the frontend/Go/NLP checks, builds the images, and proceeds to Artifact Registry and Cloud Run when deployment prerequisites are configured.
+3. `REACH-Infra/.github/workflows/reach-release.yml` resolves and verifies the tagged source commit, runs the frontend and Python FastAPI backend checks, builds the frontend and backend images from that immutable commit, and proceeds to Artifact Registry and Cloud Run when deployment prerequisites are configured.
 
 The source-side dispatcher is not included in this repository yet. This guide shows how to add it to REACH.
 
@@ -80,7 +80,7 @@ In the current Infra workflow, a `repository_dispatch` event of type `reach_rele
 
 For a non-deploying check of a REACH revision, start `REACH-Infra`'s `REACH CI/CD` workflow manually, enter `reach_tag`, and leave `deploy` unchecked. This verifies the source tag and runs tests/builds, but does not test the cross-repository token or dispatcher.
 
-Before enabling production deployment, configure the required `REACH-Infra` repository variables and review `CLOUD_RUN_PUBLIC_API=true`; the current Go API has no authentication. The existing Cloud SQL instance is not used by the current REACH services and is not modified by this workflow.
+Before enabling deployment, configure the required `REACH-Infra` repository variables and review `CLOUD_RUN_PUBLIC_API=true` because the frontend and API services are deployed as public Cloud Run services. The FastAPI app has JWT authentication routes, but deployment still needs a production `DATABASE_URL` and strong `JWT_SECRET_KEY` supplied through secure runtime configuration; this workflow does not provision or connect Cloud SQL. The existing Cloud SQL instance is not modified by this workflow.
 
 ## Troubleshooting
 

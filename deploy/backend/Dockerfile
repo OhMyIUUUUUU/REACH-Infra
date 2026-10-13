@@ -1,12 +1,17 @@
-FROM golang:1.27-alpine AS build
+FROM python:3.12-slim
 
-WORKDIR /src
-COPY reach/Backend/go.mod ./
-COPY reach/Backend/*.go ./
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/reach-backend .
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=build /out/reach-backend /reach-backend
+WORKDIR /app
+
+COPY reach/Backend/requirements.txt ./requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir -r requirements.txt
+
+COPY reach/Backend/ ./
+
 ENV PORT=8080
 EXPOSE 8080
-ENTRYPOINT ["/reach-backend"]
+
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
